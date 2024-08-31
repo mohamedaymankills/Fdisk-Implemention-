@@ -1,0 +1,165 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <linux/hdreg.h>
+
+// Constants for MBR and partition table
+#define SECTOR_SIZE 512  // Size of a sector in bytes
+#define PARTITION_TABLE_OFFSET 446  // Offset to the partition table in the MBR
+#define PARTITION_ENTRY_SIZE 16  // Size of each partition entry in bytes
+#define PARTITION_TABLE_ENTRIES 4  // Number of partition entries in the partition table
+#define MBR_SIGNATURE_OFFSET 510  // Offset to the MBR signature
+#define MBR_SIGNATURE 0xAA55  // MBR signature value
+
+// Use pragma pack to ensure the structure is packed without padding
+#pragma pack(push, 1)
+
+// Structure to represent a partition entry in the MBR
+typedef struct {
+    uint8_t status;  // Partition status (bootable or not)
+    uint8_t first_chs[3];  // CHS address of the first sector
+    uint8_t type;  // Partition type (e.g., 0x83 for Linux, 0x05 for extended)
+    uint8_t last_chs[3];  // CHS address of the last sector
+    uint32_t first_lba;  // LBA address of the first sector
+    uint32_t sectors;  // Number of sectors in the partition
+} PartitionEntry;
+
+#pragma pack(pop)
+
+// Function to read the MBR from a disk and extract the partition table
+void read_mbr(int fd, PartitionEntry *partitions) {
+    uint8_t mbr[SECTOR_SIZE];  // Buffer to hold the MBR
+
+    // Move the file descriptor to the start of the disk
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        perror("lseek");
+        exit(EXIT_FAILURE);
+    }
+
+    // Read the MBR into the buffer
+    if (read(fd, mbr, SECTOR_SIZE) != SECTOR_SIZE) {
+        perror("read");
+        exit(EXIT_FAILURE);
+    }
+
+    // Verify the MBR signature to ensure it's a valid MBR
+    if (*((uint16_t *)&mbr[MBR_SIGNATURE_OFFSET]) != MBR_SIGNATURE) {
+        fprintf(stderr, "Invalid MBR signature.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the partition table entries from the MBR into the partitions array
+    memcpy(partitions, &mbr[PARTITION_TABLE_OFFSET], PARTITION_TABLE_ENTRIES * PARTITION_ENTRY_SIZE);
+}
+
+// Function to print information about a partition
+void print_partition(PartitionEntry *partition, int num, const char *device) {
+    printf("%s%d %10u %10u %9u %6.1fG\n", device, num,
+           partition->first_lba,  // Start sector
+           partition->first_lba + partition->sectors - 1,  // End sector
+           partition->sectors,  // Total number of sectors
+           (float)partition->sectors * SECTOR_SIZE / (1024 * 1024 * 1024));  // Size in GiB
+}
+
+// Function to read and print logical partitions within an extended partition
+void read_logical_partitions(int fd, uint32_t ebr_lba, const char *device) {
+    PartitionEntry partitions[2];  // Buffer to hold partition entries from EBR
+    int logical_num = 5;  // Logical partitions typically start from /dev/sda5
+
+    // Loop through the chain of EBRs to find and print all logical partitions
+    while (ebr_lba) {
+        // Move the file descriptor to the start of the EBR
+        if (lseek(fd, ebr_lba * SECTOR_SIZE, SEEK_SET) < 0) {
+            perror("lseek");
+            exit(EXIT_FAILURE);
+        }
+
+        // Read the first two partition entries from the EBR
+        if (read(fd, partitions, 2 * PARTITION_ENTRY_SIZE) != 2 * PARTITION_ENTRY_SIZE) {
+            perror("read");
+            exit(EXIT_FAILURE);
+        }
+
+        // If the first partition in the EBR is valid, print its information
+        if (partitions[0].sectors != 0) {
+            print_partition(&partitions[0], logical_num++, device);
+        }
+
+        // Update ebr_lba to point to the next EBR in the chain, if it exists
+        ebr_lba = partitions[1].first_lba ? ebr_lba + partitions[1].first_lba : 0;
+    }
+}
+
+// Function to print general disk information
+void print_disk_info(int fd, const char *device) {
+    struct hd_geometry geo;  // Structure to hold disk geometry information
+    unsigned long long size;  // Variable to hold the disk size in bytes
+
+    // Get the disk size in bytes using ioctl
+    if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
+        perror("ioctl");
+        exit(EXIT_FAILURE);
+    }
+
+    // Get the disk geometry (heads, sectors per track, cylinders) using ioctl
+    if (ioctl(fd, HDIO_GETGEO, &geo) < 0) {
+        perror("ioctl");
+        exit(EXIT_FAILURE);
+    }
+
+    // Print the disk size, number of sectors, and other disk information
+    printf("Disk %s: %.1f GiB, %llu bytes, %llu sectors\n",
+           device, (float)size / (1024 * 1024 * 1024), size, size / SECTOR_SIZE);
+
+    printf("Disklabel type: dos\n");
+    printf("Units: sectors of 1 * %d = %d bytes\n", SECTOR_SIZE, SECTOR_SIZE);
+    printf("Sector size (logical/physical): %d bytes / %d bytes\n", SECTOR_SIZE, SECTOR_SIZE);
+    printf("I/O size (minimum/optimal): %d bytes / %d bytes\n", SECTOR_SIZE, SECTOR_SIZE);
+    printf("\n");
+    printf("Device        Start       End   Sectors   Size\n");
+}
+
+// Main function to drive the program
+int main(int argc, char *argv[]) {
+    // Check if the correct number of arguments is provided
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <device>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    // Open the disk device in read-only mode
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        exit(EXIT_FAILURE);
+    }
+
+    // Array to hold the primary partition table entries
+    PartitionEntry partitions[PARTITION_TABLE_ENTRIES];
+    read_mbr(fd, partitions);  // Read the MBR and extract the partition table
+
+    // Print general disk information
+    print_disk_info(fd, argv[1]);
+
+    // Iterate over each primary partition entry
+    for (int i = 0; i < PARTITION_TABLE_ENTRIES; i++) {
+        // If the partition entry is valid (non-zero sectors), print it
+        if (partitions[i].sectors != 0) {
+            print_partition(&partitions[i], i + 1, argv[1]);
+        }
+
+        // If the partition is an extended partition, read logical partitions
+        if (partitions[i].type == 0x05 || partitions[i].type == 0x0F) {
+            read_logical_partitions(fd, partitions[i].first_lba, argv[1]);
+        }
+    }
+
+    // Close the disk device file descriptor
+    close(fd);
+    return 0;
+}
